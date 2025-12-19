@@ -89,6 +89,21 @@ chile_earthquake_magnitude
 Puedes ver el dashboard en vivo aquí:
 - [Dashboard Chile - Grafana Cloud](https://fabianignaciomv.grafana.net/public-dashboards/1626c4fe9e1f40e987f3a22111c78013)
 
+## 📊 Dashboards Incluidos
+
+Este repo incluye dos dashboards listos para importar:
+
+| Dashboard | Descripción | Archivo |
+|-----------|-------------|---------|
+| **Chile Metrics - Histórico** | Usa Prometheus, muestra tendencias temporales | [`dashboards/chile-prometheus-dashboard.json`](dashboards/chile-prometheus-dashboard.json) |
+| **Chile - Tiempo Real** | Usa Infinity, datos en vivo de APIs | [`dashboards/chile-infinity-dashboard.json`](dashboards/chile-infinity-dashboard.json) |
+
+### Importar un Dashboard
+
+1. Ve a Grafana → **Dashboards** → **New** → **Import**
+2. Sube el archivo JSON o pega su contenido
+3. Selecciona el datasource correspondiente
+
 ## 🛠️ Desarrollo Local
 
 ```bash
