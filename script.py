@@ -7,8 +7,6 @@ Fetches data from Chilean public APIs and pushes to Grafana Cloud using Remote W
 import os
 import time
 import requests
-import snappy
-import struct
 
 # Configuration from environment variables
 PROMETHEUS_URL = os.environ.get("PROMETHEUS_URL", "")
