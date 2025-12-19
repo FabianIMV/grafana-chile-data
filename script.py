@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
 Chile Metrics Collector
-Fetches data from Chilean public APIs and pushes to Grafana Cloud Prometheus.
+Fetches data from Chilean public APIs and pushes to Grafana Cloud using Remote Write.
 """
 
 import os
 import time
 import requests
-from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
-from prometheus_client.exposition import basic_auth_handler
+import snappy
+import struct
 
 # Configuration from environment variables
-PROMETHEUS_URL = os.environ.get("PROMETHEUS_URL", "").replace("/api/prom/push", "")
+PROMETHEUS_URL = os.environ.get("PROMETHEUS_URL", "")
 PROMETHEUS_USER = os.environ.get("PROMETHEUS_USER", "")
 PROMETHEUS_PASSWORD = os.environ.get("PROMETHEUS_PASSWORD", "")
 
@@ -19,11 +19,6 @@ PROMETHEUS_PASSWORD = os.environ.get("PROMETHEUS_PASSWORD", "")
 API_CLIMA = "https://api.gael.cloud/general/public/clima"
 API_SISMOS = "https://api.gael.cloud/general/public/sismos"
 API_MONEDAS = "https://api.gael.cloud/general/public/monedas"
-
-
-def auth_handler(url, method, timeout, headers, data):
-    """Authentication handler for Prometheus push gateway."""
-    return basic_auth_handler(url, method, timeout, headers, data, PROMETHEUS_USER, PROMETHEUS_PASSWORD)
 
 
 def fetch_json(url: str) -> list:
@@ -37,158 +32,238 @@ def fetch_json(url: str) -> list:
         return []
 
 
-def collect_weather_metrics(registry: CollectorRegistry):
-    """Collect weather metrics from Chilean stations."""
-    data = fetch_json(API_CLIMA)
+def build_write_request(metrics: list) -> bytes:
+    """
+    Build a Prometheus Remote Write request.
+    Uses the protobuf format expected by Grafana Cloud.
+    """
+    # Import here to avoid issues if not installed
+    from prometheus_pb2 import WriteRequest, TimeSeries, Label, Sample
     
-    if not data:
-        print("No weather data available")
-        return
+    write_request = WriteRequest()
+    timestamp_ms = int(time.time() * 1000)
     
-    # Create gauges
-    temp_gauge = Gauge(
-        'chile_weather_temperature_celsius',
-        'Temperature in Celsius',
-        ['station', 'station_code'],
-        registry=registry
-    )
+    for metric in metrics:
+        ts = write_request.timeseries.add()
+        
+        # Add __name__ label
+        label = ts.labels.add()
+        label.name = "__name__"
+        label.value = metric["name"]
+        
+        # Add other labels
+        for label_name, label_value in metric.get("labels", {}).items():
+            l = ts.labels.add()
+            l.name = label_name
+            l.value = str(label_value)
+        
+        # Add sample
+        sample = ts.samples.add()
+        sample.value = float(metric["value"])
+        sample.timestamp = timestamp_ms
     
-    humidity_gauge = Gauge(
-        'chile_weather_humidity_percent',
-        'Humidity percentage',
-        ['station', 'station_code'],
-        registry=registry
-    )
+    return write_request.SerializeToString()
+
+
+def push_metrics_simple(metrics: list):
+    """
+    Push metrics to Grafana Cloud using the Influx line protocol.
+    This is a simpler approach that works with Grafana Cloud.
+    """
+    # Build metrics in Prometheus exposition format
+    lines = []
+    timestamp_ms = int(time.time() * 1000)
     
-    for station in data:
+    for metric in metrics:
+        name = metric["name"]
+        value = metric["value"]
+        labels = metric.get("labels", {})
+        
+        if labels:
+            label_str = ",".join([f'{k}="{v}"' for k, v in labels.items()])
+            lines.append(f"{name}{{{label_str}}} {value}")
+        else:
+            lines.append(f"{name} {value}")
+    
+    body = "\n".join(lines)
+    
+    # Push to Grafana Cloud Prometheus
+    url = f"{PROMETHEUS_URL}/api/v1/push"
+    
+    headers = {
+        "Content-Type": "text/plain",
+    }
+    
+    try:
+        response = requests.post(
+            url,
+            data=body,
+            headers=headers,
+            auth=(PROMETHEUS_USER, PROMETHEUS_PASSWORD),
+            timeout=30
+        )
+        response.raise_for_status()
+        print(f"✅ Pushed {len(metrics)} metrics successfully!")
+        return True
+    except requests.exceptions.HTTPError as e:
+        print(f"❌ HTTP Error: {e}")
+        print(f"Response: {e.response.text if e.response else 'No response'}")
+        return False
+    except Exception as e:
+        print(f"❌ Error pushing metrics: {e}")
+        return False
+
+
+def push_metrics_influx(metrics: list):
+    """
+    Push metrics using Influx line protocol (supported by Grafana Cloud).
+    """
+    timestamp_ns = int(time.time() * 1e9)
+    lines = []
+    
+    for metric in metrics:
+        name = metric["name"]
+        value = metric["value"]
+        labels = metric.get("labels", {})
+        
+        # Build tags string
+        if labels:
+            tags = ",".join([f'{k}={v.replace(" ", "_").replace(",", "")}' for k, v in labels.items()])
+            line = f"{name},{tags} value={value} {timestamp_ns}"
+        else:
+            line = f"{name} value={value} {timestamp_ns}"
+        
+        lines.append(line)
+    
+    body = "\n".join(lines)
+    
+    # Grafana Cloud Influx endpoint
+    url = f"{PROMETHEUS_URL}/api/v1/push/influx/write"
+    
+    try:
+        response = requests.post(
+            url,
+            data=body,
+            auth=(PROMETHEUS_USER, PROMETHEUS_PASSWORD),
+            timeout=30
+        )
+        response.raise_for_status()
+        print(f"✅ Pushed {len(metrics)} metrics successfully!")
+        return True
+    except requests.exceptions.HTTPError as e:
+        print(f"❌ HTTP Error {e.response.status_code}: {e}")
+        if e.response:
+            print(f"Response: {e.response.text[:500]}")
+        return False
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        return False
+
+
+def collect_all_metrics() -> list:
+    """Collect all metrics from Chilean APIs."""
+    metrics = []
+    
+    # Weather metrics
+    weather_data = fetch_json(API_CLIMA)
+    for station in weather_data:
         try:
             station_name = station.get('Estacion', 'Unknown')
             station_code = station.get('Codigo', 'Unknown')
             temp = float(station.get('Temp', 0))
             humidity = float(station.get('Humedad', 0))
             
-            temp_gauge.labels(station=station_name, station_code=station_code).set(temp)
-            humidity_gauge.labels(station=station_name, station_code=station_code).set(humidity)
+            metrics.append({
+                "name": "chile_temperature_celsius",
+                "value": temp,
+                "labels": {"station": station_name, "code": station_code}
+            })
             
-            print(f"Weather: {station_name} - Temp: {temp}°C, Humidity: {humidity}%")
+            metrics.append({
+                "name": "chile_humidity_percent",
+                "value": humidity,
+                "labels": {"station": station_name, "code": station_code}
+            })
+            
+            print(f"Weather: {station_name} - {temp}°C, {humidity}%")
         except (ValueError, TypeError) as e:
-            print(f"Error processing weather station {station}: {e}")
-
-
-def collect_earthquake_metrics(registry: CollectorRegistry):
-    """Collect earthquake metrics."""
-    data = fetch_json(API_SISMOS)
+            print(f"Error processing weather: {e}")
     
-    if not data:
-        print("No earthquake data available")
-        return
-    
-    # Create gauges for the most recent earthquakes
-    magnitude_gauge = Gauge(
-        'chile_earthquake_magnitude',
-        'Earthquake magnitude',
-        ['location', 'date'],
-        registry=registry
-    )
-    
-    depth_gauge = Gauge(
-        'chile_earthquake_depth_km',
-        'Earthquake depth in kilometers',
-        ['location', 'date'],
-        registry=registry
-    )
-    
-    # Only process the 10 most recent earthquakes
-    for quake in data[:10]:
+    # Earthquake metrics
+    quake_data = fetch_json(API_SISMOS)
+    for i, quake in enumerate(quake_data[:10]):
         try:
-            location = quake.get('RefGeografica', 'Unknown')
-            date = quake.get('Fecha', 'Unknown')
+            location = quake.get('RefGeografica', 'Unknown')[:40]
+            location = location.replace('"', '').replace("'", "").replace(",", "")
             magnitude = float(quake.get('Magnitud', 0))
             depth = float(quake.get('Profundidad', 0))
             
-            # Clean location for label (remove special chars)
-            location_clean = location[:50].replace('"', '').replace("'", "")
+            metrics.append({
+                "name": "chile_earthquake_magnitude",
+                "value": magnitude,
+                "labels": {"location": location, "index": str(i)}
+            })
             
-            magnitude_gauge.labels(location=location_clean, date=date).set(magnitude)
-            depth_gauge.labels(location=location_clean, date=date).set(depth)
+            metrics.append({
+                "name": "chile_earthquake_depth_km",
+                "value": depth,
+                "labels": {"location": location, "index": str(i)}
+            })
             
-            print(f"Earthquake: {magnitude} - {location_clean}")
+            print(f"Earthquake: {magnitude} - {location}")
         except (ValueError, TypeError) as e:
-            print(f"Error processing earthquake {quake}: {e}")
-
-
-def collect_currency_metrics(registry: CollectorRegistry):
-    """Collect currency/economic indicator metrics."""
-    data = fetch_json(API_MONEDAS)
+            print(f"Error processing earthquake: {e}")
     
-    if not data:
-        print("No currency data available")
-        return
+    # Currency metrics
+    currency_data = fetch_json(API_MONEDAS)
+    important = ['UF', 'USD', 'EUR', 'UTM', 'GBP', 'CAD', 'AUD', 'BRL', 'ARS', 'MXN']
     
-    currency_gauge = Gauge(
-        'chile_currency_value_clp',
-        'Currency value in Chilean Pesos',
-        ['code', 'name'],
-        registry=registry
-    )
-    
-    # Important currencies to track
-    important_currencies = ['UF', 'USD', 'EUR', 'UTM', 'GBP', 'CAD', 'AUD', 'BRL', 'ARS', 'MXN']
-    
-    for currency in data:
+    for currency in currency_data:
         try:
             code = currency.get('Codigo', '').strip()
-            name = currency.get('Nombre', 'Unknown').strip()
-            
-            # Only process important currencies
-            if code not in important_currencies:
+            if code not in important:
                 continue
             
-            # Handle comma as decimal separator
+            name = currency.get('Nombre', 'Unknown').strip()
             value_str = currency.get('Valor', '0').replace(',', '.')
             value = float(value_str)
             
-            currency_gauge.labels(code=code, name=name).set(value)
+            metrics.append({
+                "name": "chile_currency_clp",
+                "value": value,
+                "labels": {"code": code, "name": name}
+            })
             
-            print(f"Currency: {code} ({name}) = {value} CLP")
+            print(f"Currency: {code} = {value} CLP")
         except (ValueError, TypeError) as e:
-            print(f"Error processing currency {currency}: {e}")
+            print(f"Error processing currency: {e}")
+    
+    return metrics
 
 
-def push_metrics():
-    """Collect all metrics and push to Grafana Cloud."""
-    print(f"Starting metrics collection at {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"Pushing to: {PROMETHEUS_URL}")
+def main():
+    print(f"🇨🇱 Chile Metrics Collector")
+    print(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"URL: {PROMETHEUS_URL}")
+    print("-" * 50)
     
-    # Create a new registry for this run
-    registry = CollectorRegistry()
+    if not all([PROMETHEUS_URL, PROMETHEUS_USER, PROMETHEUS_PASSWORD]):
+        print("❌ Missing environment variables!")
+        exit(1)
     
-    # Collect all metrics
-    collect_weather_metrics(registry)
-    collect_earthquake_metrics(registry)
-    collect_currency_metrics(registry)
+    # Collect metrics
+    metrics = collect_all_metrics()
+    print("-" * 50)
+    print(f"Collected {len(metrics)} metrics")
     
-    # Push to Grafana Cloud
-    try:
-        # For Grafana Cloud, we use the /api/prom/push endpoint
-        gateway_url = PROMETHEUS_URL.rstrip('/')
-        
-        push_to_gateway(
-            gateway=gateway_url,
-            job='chile_metrics',
-            registry=registry,
-            handler=auth_handler
-        )
-        print("✅ Metrics pushed successfully!")
-    except Exception as e:
-        print(f"❌ Error pushing metrics: {e}")
-        raise
+    # Try Influx protocol first
+    if push_metrics_influx(metrics):
+        return
+    
+    # Fallback to simple push
+    print("Trying alternative push method...")
+    push_metrics_simple(metrics)
 
 
 if __name__ == "__main__":
-    if not all([PROMETHEUS_URL, PROMETHEUS_USER, PROMETHEUS_PASSWORD]):
-        print("Error: Missing environment variables")
-        print("Required: PROMETHEUS_URL, PROMETHEUS_USER, PROMETHEUS_PASSWORD")
-        exit(1)
-    
-    push_metrics()
+    main()
