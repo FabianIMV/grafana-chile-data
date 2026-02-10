@@ -123,6 +123,10 @@ export PROMETHEUS_PASSWORD="glc_xxxx..."
 python script.py
 ```
 
+## ⚠️ Nota sobre GitHub Actions
+
+GitHub desactiva automáticamente los workflows programados (scheduled) en repositorios sin actividad por 60 días. Si recibes un aviso de desactivación, simplemente haz un commit o ejecuta el workflow manualmente desde la pestaña **Actions** para reactivarlo.
+
 ## 📄 Licencia
 
 MIT - Siéntete libre de usar, modificar y distribuir.
